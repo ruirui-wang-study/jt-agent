@@ -15,12 +15,12 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
+# from langchain.agents import AgentExecutor
 from sqlalchemy import create_engine, text
 import oracledb
 
 # 加载环境变量
-load_dotenv()
+load_dotenv(override=True)
 
 # --- 数据库连接 ---
 def get_db_engine():
@@ -134,9 +134,55 @@ def list_my_tenders(carrier_id: str = None) -> str:
         return f"查询数据库时发生错误: {e}"
 
 
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+
+# ... (Previous code remains, but we will overwrite get_agent_executor and main)
+
+class SimpleAgent:
+    def __init__(self, llm, tools):
+        self.llm = llm
+        self.tools = {t.name: t for t in tools}
+        self.llm_with_tools = llm.bind_tools(tools)
+        self.system_message = SystemMessage(content="你是一个智慧运力平台的智能客服助手'运力小助手'。你需要回答货主或司机关于运力招采、标书状态的问题。\n"
+                       "你可以使用工具来查询具体的业务数据。如果用户没有提供标书ID，请先引导用户提供或先调用工具查询列表。")
+
+    def invoke(self, inputs):
+        user_input = inputs.get("input")
+        messages = [self.system_message, HumanMessage(content=user_input)]
+        
+        # Max steps to prevent infinite loops
+        for _ in range(10):
+            ai_msg = self.llm_with_tools.invoke(messages)
+            messages.append(ai_msg)
+            
+            if not ai_msg.tool_calls:
+                return {"output": ai_msg.content}
+            
+            for tool_call in ai_msg.tool_calls:
+                tool_name = tool_call["name"]
+                args = tool_call["args"]
+                tool_func = self.tools.get(tool_name)
+                
+                print(f"[调用工具] {tool_name} 参数: {args}")
+                
+                if tool_func:
+                    try:
+                        # tool.invoke accepts a dict or args depending on impl, tools created with @tool accept args directly or dict
+                        tool_result = tool_func.invoke(args)
+                    except Exception as e:
+                        tool_result = f"Error executing tool: {e}"
+                else:
+                    tool_result = f"Error: Tool {tool_name} not found"
+                
+                print(f"[工具返回] {tool_result[:200]}..." if len(str(tool_result)) > 200 else f"[工具返回] {tool_result}")
+
+                messages.append(ToolMessage(tool_call_id=tool_call["id"], content=str(tool_result)))
+        
+        return {"output": messages[-1].content}
+
 def get_agent_executor():
     """
-    初始化并返回一个支持工具调用的 AgentExecutor
+    初始化并返回一个支持工具调用的 Agent (手动实现版)
     """
     api_key = os.getenv("OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_API_BASE")
@@ -151,31 +197,18 @@ def get_agent_executor():
         api_key=api_key,
         base_url=base_url,
         model=model_name,
-        temperature=0.3 # 降低温度以提高工具调用的准确性
+        temperature=0.3
     )
 
     # 2. 定义工具列表
     tools = [check_tender_result, list_my_tenders]
 
-    # 3. 创建 Prompt
-    # 包含了 system message 和 placeholder for agent_scratchpad
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "你是一个智慧运力平台的智能客服助手'运力小助手'。你需要回答货主或司机关于运力招采、标书状态的问题。\n"
-                   "你可以使用工具来查询具体的业务数据。如果用户没有提供标书ID，请先引导用户提供或先调用工具查询列表。"),
-        ("user", "{input}"),
-        ("placeholder", "{agent_scratchpad}"),
-    ])
+    # 3. 返回简单的手动Agent
+    return SimpleAgent(llm, tools)
 
-    # 4. 创建 Agent
-    agent = create_tool_calling_agent(llm, tools, prompt)
-
-    # 5. 创建 Executor
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-    
-    return agent_executor
 
 def main():
-    print("正在初始化智慧运力智能客服 Agent (带业务工具)...")
+    print("正在初始化智慧运力智能客服 Agent (带业务工具 - Manual Mode)...")
     agent_executor = get_agent_executor()
     
     if not agent_executor:
